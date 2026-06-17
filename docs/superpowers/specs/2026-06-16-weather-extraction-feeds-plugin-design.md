@@ -16,8 +16,14 @@ public `led_ticker.plugin` surface — `as_color_provider`, `FrameAwareBase`,
 `draw_text` / `draw_text_per_char`, `draw_emoji_at` / `measure_emoji_at`,
 `FONT_DEFAULT`, the `colors` module, `run_monitor_loop`, `spawn_tracked`. P3
 pre-provisioned all of these and pre-whitelisted weather in the readiness
-allowlist. **No public-API work is required.** `aiohttp` is already a feeds
+allowlist, so the **import audit needs no API work**. `aiohttp` is already a feeds
 dependency; weather adds **no new dependency** (rss brought `feedparser`).
+
+The one deliberate public-API addition is *not* driven by an import the audit
+missed — it's an architecture choice (decision below): exposing the rich
+color-spec coercion as `coerce_color_provider` so the plugin can own coercion of
+its plugin-unique `font_color_temp` field instead of leaning on core's private
+field-name registry. That's Phase 0, a small additive core PR that merges first.
 
 **Decisions (from brainstorm):**
 - Namespaced type: **`feeds.weather`** (old `weather`).
@@ -31,15 +37,51 @@ dependency; weather adds **no new dependency** (rss brought `feedparser`).
   `weather.py` (no separate module — YAGNI). The widget renders icons via the
   public `draw_emoji_at(canvas, _match_condition(cond), …)` using core slugs.
   No user-facing emoji change, no public-API growth.
-- **`font_color_temp` coercion stays in core.** Core's `app/coercion.py`
-  auto-coerces the color-field names (`font_color`, `font_color_temp`, …) at
-  config-load for ALL widgets including plugins — so the plugin's two-color
-  design gets `font_color_temp` coerced for free, exactly as rss leaned on core's
-  `font_color` coercion. Retained as a documented plugin hook (a code comment),
-  same pattern as the other "extracted widgets retain core hooks" symbols.
-- **Plugin-first sequencing**: build + merge the feeds PR, then a core removal
-  PR — so core never has a gap. Merge gate: feeds PR merges first. Explicit
-  per-PR merge consent required (never merge without James's go-ahead).
+- **`font_color_temp` coercion moves to the plugin via a new public primitive.**
+  Today core's private `app/coercion._coerce_color_provider` parses the rich
+  color forms (`[r,g,b]`, `"rainbow"` / `"color_cycle"` / `"shimmer"` /
+  `"random"`, `{style = "gradient", …}`), triggered by a field-name registry
+  (`_PROVIDER_COLOR_KEYS`). Plugins lean on that registry by coincidence — the
+  parser was never public, and the public `as_color_provider` only wraps a
+  *constant* `Color` (so `as_color_provider("rainbow")` would break). The
+  long-term-correct separation is to **expose the parser** as
+  `coerce_color_provider(value, context="font_color") -> ColorProvider | None`
+  on `led_ticker.plugin`, then have the plugin coerce its own plugin-unique color
+  field (`font_color_temp`). Establishes the rule: **shared/generic color field
+  names (`font_color`, `top_color`, …) stay core-coerced; plugin-unique color
+  fields are coerced by the plugin via the public primitive.** `font_color`
+  remains core-coerced (still used by `message`/etc.), so the plugin keeps
+  relying on it for that field exactly as `feeds.rss` does.
+- **Three-phase sequencing** (the public primitive forces a prerequisite phase):
+  Phase 0 adds `coerce_color_provider` to core's public surface and merges
+  first (purely additive, safe); Phase A ports the plugin (its CI
+  sibling-checks-out core `main`, so the symbol must already be there); Phase B
+  removes the core widget. Two merge gates: 0 → A → B. Explicit per-PR merge
+  consent required (never merge without James's go-ahead).
+
+## Phase 0 — public `coerce_color_provider` (core, additive, merges first)
+
+A small, purely additive core PR that ships the missing ecosystem primitive.
+Nothing is removed, so it's safe to land independently.
+- `src/led_ticker/plugin.py`: add a thin public wrapper and append it to
+  `__all__`:
+  ```python
+  def coerce_color_provider(value, context="font_color"):
+      """Parse a TOML color spec — constant [r, g, b]; "rainbow" /
+      "color_cycle" / "shimmer" / "random"; or {style = "...", ...} — into a
+      ColorProvider (None for None input). The public primitive for plugins
+      with custom color fields; mirrors how core coerces font_color at
+      config-load. Already-a-provider values pass through unchanged."""
+      from led_ticker.app.coercion import _coerce_color_provider
+      return _coerce_color_provider(value, context)
+  ```
+- `docs/site/src/content/docs/plugins/api-reference.mdx`: add the
+  `coerce_color_provider` row inside the marked region (the drift guard
+  `tests/test_docs_plugin_api_drift.py` compares `plugin.__all__` against this
+  page; both must match).
+- Test: assert `coerce_color_provider("rainbow", "font_color_temp")` returns a
+  per-frame provider, `[r,g,b]` returns a constant provider, an already-provider
+  passes through, and the drift test stays green.
 
 ## Phase A — `feeds.weather` in `led-ticker-feeds`
 
@@ -56,6 +98,16 @@ dependency; weather adds **no new dependency** (rss brought `feedparser`).
   - Inline `_match_condition` as a module-level function (lifted verbatim from
     core's `weather_icons.py`); drop the
     `from led_ticker.widgets.weather_icons import _match_condition` lazy import.
+  - **Color coercion** (the B-proper change): import `coerce_color_provider`
+    from `led_ticker.plugin`. In `__attrs_post_init__`, coerce `font_color_temp`
+    via `coerce_color_provider(self.font_color_temp, "font_color_temp")` instead
+    of the constant-only `as_color_provider` (core no longer pre-coerces this
+    plugin-unique field; raw `"rainbow"` / `{style=…}` would otherwise reach the
+    widget). Coerce `font_color` the same way for symmetry — it's idempotent
+    (already-a-provider passes through), and core still pre-coerces `font_color`,
+    so this is a safe no-op there. The `if not hasattr(..., "color_for")` guards
+    are replaced by direct `coerce_color_provider` calls (pass-through handles the
+    already-coerced case).
   - Keep the rest verbatim: `start()` classmethod, `async update()` with the
     aiohttp fetch, the `WEATHERAPI_KEY` env read (raises `ValueError` if unset),
     `FrameAwareBase` inheritance, the two-color `font_color` (label) +
@@ -122,10 +174,11 @@ dependency; weather adds **no new dependency** (rss brought `feedparser`).
   - Remove the `font_color_temp` and `show_icon` `FieldHint`s (weather-specific
     `--list-fields` surface; moves to the plugin).
   - Remove `"weather"` from the `message`→`text` migration-check tuple.
-- `src/led_ticker/app/coercion.py`: KEEP `font_color_temp` in the color-coercion
-  list; add a comment noting it is a retained hook for the feeds plugin's
-  `feeds.weather` two-color design (mirrors core's `font_color` coercion that
-  `feeds.rss` relies on).
+- `src/led_ticker/app/coercion.py`: **remove** `font_color_temp` from
+  `_PROVIDER_COLOR_KEYS` (it's no longer a core-known field — the plugin now
+  coerces it via the public `coerce_color_provider` from Phase 0). Leave
+  `font_color`, `top_color`, etc. (still used by core widgets). Update the
+  surrounding comment to note that plugin-unique color fields self-coerce.
 - Tests:
   - Delete `tests/test_widgets/test_weather.py`.
   - Delete the golden `tests/golden/list_fields/weather.txt` and its entry in
@@ -175,6 +228,9 @@ dependency; weather adds **no new dependency** (rss brought `feedparser`).
 
 ## Testing
 
+- **Phase 0 (core)**: `coerce_color_provider` unit test (rich-form parsing +
+  pass-through) green; `test_docs_plugin_api_drift` green with the new symbol
+  documented; `make test` otherwise unchanged.
 - **Plugin**: ported weather tests green; `_match_condition` tests green;
   `test_import_purity` (only-public imports, covers weather.py); `test_smoke`
   (`feeds.weather` registers); coverage ≥ 90%; CI green (sibling checkout).
@@ -193,7 +249,14 @@ dependency; weather adds **no new dependency** (rss brought `feedparser`).
 
 ## Delivery
 
-Plugin-first. Phase A: port `weather.py` + inline `_match_condition` + tests +
-README/GIF in `led-ticker-feeds` → PR → (await explicit consent) → merge. Phase
-B: core removal PR → (await explicit consent, after Phase A merged) → merge. The
-spec + plan live in this repo (`led-ticker-feeds/docs/superpowers/`).
+Three phases, two merge gates, explicit per-PR consent at each merge:
+1. **Phase 0** (core, additive): add public `coerce_color_provider` + its
+   api-reference row → PR → merge first.
+2. **Phase A** (plugin): port `weather.py` + inline `_match_condition` +
+   plugin-side `coerce_color_provider` coercion + tests + README/GIF → PR →
+   merge (needs Phase 0 on core `main` for its sibling-checkout CI).
+3. **Phase B** (core removal): delete the widget, remove `font_color_temp` from
+   coercion, migration entry + reverse-coupling sweep, docs reframe → PR → merge
+   last (after Phase A).
+
+The spec + plan live in this repo (`led-ticker-feeds/docs/superpowers/`).
