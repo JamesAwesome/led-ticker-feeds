@@ -15,9 +15,13 @@ This plugin contributes, via the `led_ticker.plugins` entry point, data-feed wid
 - `feeds.rss` — headlines from any RSS feed; a Container that polls in the background and
   populates `feed_stories` with `TickerMessage` items; the display loop re-reads the list on
   every pass, so updates surface within one cycle without restarting.
+- `feeds.weather` — current conditions from [WeatherAPI.com](https://www.weatherapi.com/);
+  renders `Label: <condition-icon> <temp>°` on one line with a two-color design (`font_color`
+  for the label, `font_color_temp` for the temperature value); polls in the background via
+  `run_monitor_loop`.
 
-The entry-point name `feeds` is the plugin namespace, so the config type is `feeds.rss`
-(see `register()` in `__init__.py`).
+The entry-point name `feeds` is the plugin namespace, so the config types are `feeds.rss`
+and `feeds.weather` (see `register()` in `__init__.py`).
 
 ## Commands
 
@@ -43,6 +47,7 @@ Python **3.14+** only.
 src/led_ticker_feeds/
   __init__.py   # register(api) entry point — the only place names are registered
   rss.py        # feeds.rss widget (RSSFeedMonitor)
+  weather.py    # feeds.weather widget (WeatherWidget)
 ```
 
 `register()` in `__init__.py`:
@@ -50,6 +55,7 @@ src/led_ticker_feeds/
 ```python
 def register(api):
     api.widget("rss")(RSSFeedMonitor)
+    api.widget("weather")(WeatherWidget)
 ```
 
 ## Load-bearing invariants
@@ -63,10 +69,10 @@ Intra-package imports (`from led_ticker_feeds.rss import …`) are fine. If you 
 that isn't on `led_ticker.plugin.__all__`, that's a core API change — raise it upstream, don't
 reach around the surface.
 
-**`_colors` import alias** — `rss.py` imports `led_ticker.plugin.colors as _colors` (with the
-leading underscore). This is intentional: `RSSFeedMonitor` has an attrs field named `colors`, and
-using the same name for the module import would shadow it inside the class body. Do NOT rename the
-import alias back to `colors` — it reintroduces the shadow.
+**`_colors` import alias** — `rss.py` and `weather.py` both import `led_ticker.plugin.colors as _colors`
+(with the leading underscore). This is intentional: `RSSFeedMonitor` has an attrs field named `colors`, and
+using the same name for the module import would shadow it inside the class body. `WeatherWidget` follows
+the same convention for consistency. Do NOT rename the import alias back to `colors` — it reintroduces the shadow.
 
 **Plugin shape** — entry point `feeds = "led_ticker_feeds:register"` (in `pyproject.toml`);
 namespace `feeds`; `register(api)` calls `api.widget("rss")(RSSFeedMonitor)` which makes the
@@ -91,10 +97,17 @@ is explicitly set (e.g. `font_color = "rainbow"`), ALL stories share it. Both pa
 **Python 3.14 / PEP 649** — no `from __future__ import annotations` anywhere (same rule as core).
 Bare `tuple[int, int, int]` annotations are fine.
 
-**Weather-ready** — adding a planned `feeds.weather` widget means creating a new module and adding
-one `api.widget("weather")(WeatherWidget)` line in `register()`. The namespace stays `feeds`.
-No structural change to `__init__.py` or `rss.py` is needed; import-purity and smoke tests cover
-the new module automatically.
+**`feeds.weather` two-color design** — `WeatherWidget` keeps two color knobs: `font_color` for the
+label segment (e.g. `"Brooklyn:"`) and `font_color_temp` for the temperature value (e.g. `"64F"`).
+`font_color_temp` is coerced IN-WIDGET via the public `coerce_color_provider` in `__attrs_post_init__`
+— core does NOT coerce this plugin-unique field name, so the call in `weather.py` is the single
+authoritative coercion site. `font_color` is also coerced there (idempotent: core may or may not
+pre-coerce a field by that name). `_match_condition` is an inlined plugin-internal helper that maps
+a WeatherAPI condition string to a core emoji slug (`"sun"`, `"cloud"`, `"rain"`, `"snow"`,
+`"thunder"`, `"fog"`, `"partly_cloudy"`); the pixel-art sprites live in core's emoji registry and
+the widget reaches them only through the public `draw_emoji_at` / `measure_emoji_at` API. Do NOT
+reach into core's emoji internals to add new slugs — that is an upstream change. `WEATHERAPI_KEY`
+must be set in the environment or `update()` raises `ValueError` immediately.
 
 ## Tests / CI
 
